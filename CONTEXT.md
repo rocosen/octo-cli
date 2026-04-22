@@ -39,6 +39,69 @@
 1. 先试 `taskController`（新引擎 workflows Map）
 2. 失败则 `appWindow.executeRunnerCommand(taskId, command)`（通过 executeJS 调用渲染进程 `__cliStatus` 方法）
 
+## 云/本地拆分逻辑（v0.4.0 新增）
+
+### 问题背景
+
+GUI 任务列表在显示时，同一个 taskId 会展示为**两行**：
+- 云采集行（☁️ 图标）：显示云采集状态和数据量
+- 本地采集行（💻 图标）：显示本地采集状态和数据量
+
+但 CLI 早期版本只输出一行，丢失了云/本地隔离的数据。
+
+### 实现方案
+
+**数据源**：
+- API (`searchTaskListV3`) 返回一条记录，同时包含云和本地数据：
+  - `taskExecuteStatus` / `currentTotalExtractCount` - 云采集状态和数据量
+  - `local.Status` / `local.CollectCount` - 本地采集状态和数据量（来自 runner 窗口）
+
+**拆分逻辑** (cli-server.ts `expandTaskToRecords` 函数):
+1. 每个任务生成**两条** `CliTaskInfo` 记录
+2. **云采集记录**：
+   - `runOn: 'cloud'`
+   - `status`: 映射 `taskExecuteStatus`（CloudStatus → CLI status）
+   - `total`: `currentTotalExtractCount`
+   - `mode`: 根据 `cloudPanelMap` 识别是否为云采集
+3. **本地采集记录**：
+   - `runOn: 'local'`
+   - `status`: 映射 `local.Status`（RunnerStatus → CLI status）
+   - `total`: `local.CollectCount`（runner 窗口实时数据）
+   - `mode`: `local` / `local-speed`（根据 `isSpeedMode`）
+   - `browser`: `kernel` / `chrome`（根据 `useKernelBrowser`）
+
+**状态映射**：
+- CloudStatus: `Running(1)→running`, `Ready(0)→idle`, `Waitting(6)→running`, `Completed(4)→completed`, `Stoped(5)→stopped`
+- RunnerStatus: `Start(1)→running`, `Pause(2)→paused`, `Stop(3)→stopped`, `Complete(4)→completed`, `Idle(0)→idle`
+
+### CLI 输出示例
+
+```bash
+$ octo task list
+运行中的任务 (4):
+
+  ID          名称              运行方式  状态    采集量    采集模式    浏览器    耗时
+  abc-123     央视新闻          云采集    已停止  13        云采集      -         5m
+  abc-123     央视新闻          本地      已停止  6         本地        内置      3m
+  def-456     淘宝监控          云采集    运行中  1,234     云采集      -         12m
+  def-456     淘宝监控          本地      暂停    567       本地-加速   独立      8m
+```
+
+### 实现文件
+
+**octopus 仓库**:
+- `src/main/cli-server.ts`:
+  - 增加 `CliTaskInfo.runOn` 字段
+  - 增加 `CloudStatus` 枚举和状态映射函数
+  - 增加 `expandTaskToRecords()` 函数
+  - 修改 `task.list` 和 `handleTaskQuery` 使用展开逻辑
+
+**octo-cli 仓库**:
+- `src/index.ts`:
+  - 增加 `formatRunOn()` 格式化函数
+  - 表格列增加"运行方式"列
+  - 更新帮助文档示例和字段说明
+
 ## 仓库结构
 
 ### octo-cli 仓库
@@ -113,6 +176,7 @@ interface CliResponse {
 interface CliTaskInfo {
     taskId: string;                                      // 任务 ID
     taskName: string;                                    // 任务名称
+    runOn: 'cloud' | 'local';                            // v0.4.0 新增：云采集或本地采集
     status: 'idle' | 'running' | 'paused' | 'stopped' | 'completed';  // 运行状态（v0.3.0 扩展）
     total: number;                                       // 已采集数据量
     mode: 'local' | 'local-speed' | 'cloud' | '-';      // 采集模式
@@ -431,6 +495,54 @@ OCTO_NO_INTERACTIVE=1 octo task start abc123 --cloud
 3. **Agent 友好**: 详细 help 文档 + 稳定 JSON schema
 4. **智能约束**: 根据任务类型动态调整选项（避免无效选择）
 5. **Ctrl+C 友好**: `prompts` 库内置优雅退出
+
+## v0.4.0 更新内容（2026-04-22）
+
+### 新增功能
+
+1. **云/本地拆分显示**
+   - `task list` 将每个任务拆分为云采集和本地采集两条记录
+   - 新增"运行方式"列，显示云采集/本地采集
+   - 与 GUI 任务列表的显示逻辑保持一致
+
+2. **`runOn` 字段**
+   - `CliTaskInfo` 接口新增 `runOn: 'cloud' | 'local'` 字段
+   - JSON 输出包含 `runOn` 字段，便于脚本区分云/本地记录
+
+3. **状态精确映射**
+   - 云采集状态映射：CloudStatus → CLI status
+   - 本地采集状态映射：RunnerStatus → CLI status
+   - 分别展示云和本地的独立状态和数据量
+
+### 技术改动
+
+**octopus 仓库** (`src/main/cli-server.ts`):
+- 新增 `CloudStatus` 枚举定义
+- 新增 `mapCloudStatus()` 和 `mapLocalStatus()` 状态映射函数
+- 新增 `expandTaskToRecords()` 函数，将一个任务展开为云/本地两条记录
+- 修改 `task.list` 和 `handleTaskQuery` 使用展开逻辑
+
+**octo-cli 仓库** (`src/index.ts`):
+- 新增 `formatRunOn()` 格式化函数
+- 表格列定义增加"运行方式"列
+- 更新帮助文档示例和字段说明
+
+### 设计决策
+
+**为什么拆分而不是合并？**
+- GUI 显示逻辑：同一任务的云/本地数据在状态列渲染为两行（参考 `TaskStatusCol` 组件）
+- 数据隔离：云采集和本地采集的状态、数据量、运行时间完全独立
+- 用户需求：用户需要分别查看云/本地的采集进度
+
+**拆分的收益**：
+- CLI 输出与 GUI 一致，降低用户学习成本
+- 支持分别查看云/本地的采集状态和数据量
+- `--json` 输出中可通过 `runOn` 字段过滤云/本地记录
+
+**实现要点**：
+- 数据源：API 返回一条记录，包含 `taskExecuteStatus`（云）和 `local.Status`（本地）
+- 展开时机：在 cli-server.ts 聚合数据时展开，CLI 端直接渲染
+- 过滤策略：默认模式只保留有数据的记录（status=running/paused 或 total>0）
 
 ## 下一步
 

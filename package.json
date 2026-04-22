@@ -1,6 +1,6 @@
 {
   "name": "@rocosenyyy/octo-cli",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "八爪鱼采集器命令行工具 - 通过终端控制八爪鱼客户端",
   "main": "dist/index.js",
   "bin": {

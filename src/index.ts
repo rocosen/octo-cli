@@ -50,6 +50,14 @@ function formatBrowser(browser: string): string {
 	}
 }
 
+function formatRunOn(runOn: string): string {
+	switch (runOn) {
+		case 'cloud': return '云采集';
+		case 'local': return '本地';
+		default: return runOn;
+	}
+}
+
 function formatStatus(status: string): string {
 	switch (status) {
 		case 'idle': return '空闲';
@@ -244,11 +252,13 @@ task
 
   # 基础用法 - 列出运行中任务（表格格式）
   $ octo task list
-  运行中的任务 (2):
+  运行中的任务 (4):
 
-    ID                                    名称              状态    采集量    采集模式    浏览器    耗时
-    abc-123                               央视新闻搜索      运行中  1,234     本地-加速   独立      5m
-    def-456                               淘宝商品监控      暂停    567       云采集      -         12m
+    ID                                    名称              运行方式  状态    采集量    采集模式    浏览器    耗时
+    abc-123                               央视新闻搜索      云采集    已停止  13        云采集      -         5m
+    abc-123                               央视新闻搜索      本地      已停止  6         本地        内置      3m
+    def-456                               淘宝商品监控      云采集    运行中  1,234     云采集      -         12m
+    def-456                               淘宝商品监控      本地      暂停    567       本地-加速   独立      8m
 
   # 查询所有任务（含历史）
   $ octo task list --all
@@ -289,6 +299,7 @@ task
   表格模式列:
     - ID: 任务唯一标识符
     - 名称: 任务名称
+    - 运行方式: cloud（云采集）/ local（本地采集）
     - 状态: idle（空闲）/ running（运行中）/ paused（暂停）/ stopped（已停止）/ completed（已完成）
     - 采集量: 已采集的数据条数
     - 采集模式: local（本地普通）/ local-speed（本地加速）/ cloud（云采集）/ -（未运行）
@@ -298,6 +309,7 @@ task
   JSON 模式字段:
     - taskId: 任务 ID
     - taskName: 任务名称
+    - runOn: 运行方式（cloud=云采集 / local=本地采集）
     - status: 状态（idle/running/paused/stopped/completed）
     - total: 已采集数据量
     - mode: 采集模式（local/local-speed/cloud/-）
@@ -359,6 +371,7 @@ task
 			const cols: { key: string; label: string; width: number; fmt?: (v: any) => string }[] = [
 				{ key: 'taskId', label: 'ID', width: 14 },
 				{ key: 'taskName', label: '名称', width: 20 },
+				{ key: 'runOn', label: '运行方式', width: 10, fmt: formatRunOn },
 				{ key: 'status', label: '状态', width: 8, fmt: formatStatus },
 				{ key: 'total', label: '采集量', width: 10, fmt: formatNumber },
 				{ key: 'mode', label: '采集模式', width: 12, fmt: formatMode },
