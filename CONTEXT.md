@@ -170,6 +170,8 @@ interface CliResponse {
 | `task.pause` | `{ taskId }` | taskController → fallback executeRunnerCommand | 无 |
 | `task.resume` | `{ taskId }` | taskController → fallback executeRunnerCommand | 无 |
 | `task.data` | `{ taskId, runOn?, all?, limit?, offset?, fields?, stats?, schema? }` | 查询任务采集数据 | `CliTaskDataResponse` |
+| `task.lots` | `{ taskId }` | 查询任务的云/本地采集批次历史列表，按时间倒序 | `{ ok, lots: CliLotInfo[] }` |
+| `task.export` | `{ taskId, lotId?, all?, runOn?, format, outputPath }` | 将指定批次数据导出为本地文件 | `{ ok, outputPath, rowCount }` |
 
 ### task.list 返回的 CliTaskInfo 结构
 
@@ -292,6 +294,80 @@ $ octo task start abc123
 | 4 | Pdf | ✅ 本地/云 | ✅ 普通/加速（如支持） | ❌ 强制内置 |
 | 5 | App | ✅ 本地/云 | ✅ 普通/加速（如支持） | ❌ 无浏览器选项 |
 | 6 | CloudWeb | ❌ 强制云采集 | ❌ 无 | ❌ 无 |
+
+### `octo task export <taskId>` (v0.6.0 新增)
+
+导出任务采集数据到本地文件，支持交互式批次选择和命令行参数模式。
+
+```bash
+# 交互式（TTY 环境）：选择批次 → 格式 → 保存路径
+octo task export abc123
+
+# 跑完任务直接导出（无交互，最新批次 + xlsx）
+octo task export abc123 --yes
+
+# 停止后立刻导出的快捷链路
+octo task stop abc123 && octo task export abc123 --format csv --yes
+
+# 指定格式
+octo task export abc123 --format csv --yes
+octo task export abc123 --format json --yes
+
+# 指定批次 ID
+octo task export abc123 --lot cld-001 --format json
+
+# 导出全部历史数据（不按批次）
+octo task export abc123 --all --format csv --yes
+
+# 指定输出路径（目录或完整文件名）
+octo task export abc123 --format csv --output ~/data --yes
+octo task export abc123 --format json --output ~/data/result.json --yes
+
+# 列出可用批次
+octo task export abc123 --list-lots
+octo task export abc123 --list-lots --json
+
+# JSON 格式输出（脚本/Agent 友好）
+octo task export abc123 --format csv --yes --json
+```
+
+**参数**：
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--lot <lotId>` | 指定批次 ID | 交互选择 / 最新批次 |
+| `--all` | 导出全部历史数据，不按批次过滤 | false |
+| `--format <fmt>` | 导出格式：xlsx/csv/json/html/xml | xlsx |
+| `--output <path>` | 输出目录或完整文件路径 | ~/Downloads/<taskId>-<日期>.<格式> |
+| `--list-lots` | 仅列出批次，不导出 | - |
+| `-y, --yes` | 跳过交互，使用默认值 | - |
+| `--json` | JSON 格式输出 | - |
+
+**交互式流程**（无 `--lot`/`--yes`/非 TTY 时）：
+1. 展示云+本地批次列表（按时间倒序），标注来源、时间、数据量
+2. 选择导出格式
+3. 确认保存路径（默认 ~/Downloads/<taskId>-<日期>.<格式>）
+4. 若文件已存在，询问是否覆盖
+
+**`--list-lots --json` 返回格式**：
+```json
+[
+  { "lotId": "cld-001", "runOn": "cloud",  "time": "2026-04-23T13:45:00Z", "count": 1234, "status": "completed" },
+  { "lotId": "lcl-002", "runOn": "local",  "time": "2026-04-23T12:30:00Z", "count": 567,  "status": "completed" }
+]
+```
+
+**导出成功 `--json` 返回格式**：
+```json
+{
+  "ok": true,
+  "taskId": "abc123",
+  "lotId": "cld-001",
+  "format": "xlsx",
+  "outputPath": "/Users/xxx/Downloads/abc123-2026-04-23.xlsx",
+  "rowCount": 1234
+}
+```
 
 ### `octo task stop/pause/resume <taskId>`
 
@@ -735,6 +811,48 @@ OCTO_NO_INTERACTIVE=1 octo task start abc123 --cloud
 **为什么 `stats` 和 `schema` 不返回 `rows`？**
 - 两者的目标是“探查结构”而非“读取内容”
 - 返回空 `rows` 可减少输出体积，也更适合脚本消费
+
+## v0.6.0 更新内容（2026-04-23）
+
+### 新增功能
+
+1. **`task export` 导出命令**
+   - 将任务采集数据导出为本地文件（xlsx/csv/json/html/xml）
+   - 支持交互式批次选择（云+本地混合展示，按时间倒序）
+   - `--list-lots` 枚举批次列表（JSON 契约，供脚本消费）
+   - `--yes` 模式：最新批次 + xlsx + ~/Downloads，完全无交互
+   - `--all` 模式：全部历史数据（不按批次过滤）
+   - 文件存在时询问覆盖（`--yes` 自动覆盖）
+   - `--output` 支持目录或完整文件路径，自动展开 `~`
+
+2. **快捷导出链路**
+   ```bash
+   octo task stop abc123 && octo task export abc123 --format csv --yes
+   ```
+
+### 技术改动
+
+**octopus 仓库** (`src/renderer/pages/home/index.tsx`):
+- 新增 `import fs from 'fs'` / `import path from 'path'`
+- `window.__cliQuery` 新增 `getLots(taskId)` — 查询云+本地批次历史列表
+- `window.__cliQuery` 新增 `exportData(params)` — 分批读取数据并用 fs 写文件
+
+**octopus 仓库** (`src/main/cli-server.ts`):
+- 新增 `task.lots` action — 代理到 `__cliQuery.getLots()`
+- 新增 `task.export` action — 代理到 `__cliQuery.exportData()`，参数校验（taskId/format/outputPath/validFormats）
+
+**octo-cli 仓库** (`src/index.ts`):
+- 新增 `resolveOutputPath()` 工具函数（`~` 展开、目录自动命名）
+- 新增 `task export` 命令（含完整 `--help` 文档）
+- 更新 `rootHelpText` / `taskHelpText` 加入 export 条目
+
+### 设计决策
+
+**批次选择取代来源选择**：批次（lot）本身携带来源信息（cloud/local），用户选批次即隐式选了来源，不再单独问"云还是本地"。
+
+**导出逻辑在渲染进程实现**：`exportData` 在 `__cliQuery` 内通过 `fs` 直接写文件，复用了 `TaskFileContronller`/`TaskLotContronller`/`taskDataService` 已有的数据读取能力，无需重造导出格式转换逻辑。
+
+**`--yes` 的默认值约定**：lot=最新批次、format=xlsx、output=~/Downloads。覆盖了"跑完直接导出"的最常见场景。
 
 ## 下一步
 

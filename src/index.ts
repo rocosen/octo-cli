@@ -159,6 +159,30 @@ function handleError(err: any): never {
 	process.exit(code);
 }
 
+function resolveOutputPath(outputPath: string | undefined, taskId: string, format: string): string {
+	const os = require('os');
+	const path = require('path');
+	const dateSuffix = new Date().toISOString().slice(0, 10);
+	const defaultFileName = `${taskId}-${dateSuffix}.${format}`;
+
+	if (!outputPath) {
+		return path.join(os.homedir(), 'Downloads', defaultFileName);
+	}
+
+	// ~ 展开
+	const expanded = outputPath.startsWith('~')
+		? path.join(os.homedir(), outputPath.slice(1))
+		: outputPath;
+
+	// 如果是目录路径（无扩展名），自动追加文件名
+	const ext = path.extname(expanded);
+	if (!ext) {
+		return path.join(expanded, defaultFileName);
+	}
+
+	return expanded;
+}
+
 const rootHelpText = `
 常用操作:
   octo ping                                    检查客户端是否在线
@@ -169,6 +193,7 @@ const rootHelpText = `
   octo task pause <taskId>                     暂停任务
   octo task resume <taskId>                    恢复任务
   octo task data <taskId>                      查看任务采集结果数据
+  octo task export <taskId> --yes              导出最新批次数据到 ~/Downloads
 
 批量操作示例:
   # 停止所有运行中的任务
@@ -216,12 +241,19 @@ const taskHelpText = `
   octo task start <taskId> --visual           使用独立浏览器（仅本地采集）
   octo task start <taskId> --speed --visual   本地加速+独立浏览器
   octo task start <taskId> --cloud --yes      云采集（跳过交互，批量操作用）
+  octo task start <taskId> --export           启动任务并在完成后自动导出 xlsx
+  octo task start <taskId> --export --export-format csv  完成后自动导出 CSV
+  octo task start <taskId> --export --export-output ~/data  导出到指定目录
 
 任务控制:
   octo task stop <taskId>                     停止指定任务
   octo task pause <taskId>                    暂停指定任务
   octo task resume <taskId>                   恢复已暂停的任务
   octo task data <taskId>                     查看任务采集结果数据
+  octo task export <taskId>                   导出任务数据到本地文件（交互式）
+  octo task export <taskId> --yes             导出最新批次到 ~/Downloads（无交互）
+  octo task export <taskId> --format csv --yes  导出 CSV 格式
+  octo task export <taskId> --list-lots       列出所有可用批次
 
 批量操作示例:
   # 查询所有运行中任务的 ID
@@ -507,6 +539,9 @@ task
 	.option('--visual', '使用独立浏览器（默认内置浏览器，仅本地采集有效）')
 	.option('-y, --yes', '使用默认值，跳过交互式选择')
 	.option('--json', 'JSON 格式输出')
+	.option('--export', '采集完成后自动导出数据')
+	.option('--export-format <format>', '自动导出格式 (xlsx/csv/json/html/xml)', 'xlsx')
+	.option('--export-output <path>', '自动导出路径（默认 ~/Downloads/）')
 	.addHelpText('after', `
 使用模式:
 
@@ -566,6 +601,9 @@ task
   --visual         使用独立浏览器（默认内置浏览器，仅本地采集且非 JSON 任务有效）
   -y, --yes        跳过交互式选择，使用默认值或命令行参数
   --json           JSON 格式输出
+  --export         采集完成后自动导出数据（默认格式 xlsx，路径 ~/Downloads/）
+  --export-format  自动导出格式：xlsx/csv/json/html/xml（默认 xlsx）
+  --export-output  自动导出路径（同 export --output，支持 ~ 展开）
 
 交互式启动逻辑:
 
@@ -612,7 +650,7 @@ task
   - 如需确认任务启动，请使用 octo task list 检查任务状态
   - 交互式模式下，Ctrl+C 可随时取消操作
   - 批量操作时务必加 --yes 避免卡在交互提示`)
-	.action(async (taskId: string, opts: { cloud?: boolean; speed?: boolean; visual?: boolean; yes?: boolean; json?: boolean }) => {
+	.action(async (taskId: string, opts: { cloud?: boolean; speed?: boolean; visual?: boolean; yes?: boolean; json?: boolean; export?: boolean; exportFormat?: string; exportOutput?: string }) => {
 		try {
 			// 检查是否跳过交互
 			const hasExplicitFlags = opts.cloud || opts.speed || opts.visual;
@@ -710,6 +748,18 @@ task
 				if (opts.visual) params.visual = true;
 			}
 
+			if (opts.export) {
+				const fmt = opts.exportFormat ?? 'xlsx';
+				const validExportFormats = ['xlsx', 'csv', 'json', 'html', 'xml'];
+				if (!validExportFormats.includes(fmt)) {
+					console.error(`错误: --export-format 无效，支持: ${validExportFormats.join(', ')}`);
+					process.exit(EXIT_OPERATION_FAILED);
+				}
+				params.export = true;
+				params.exportFormat = fmt;
+				params.exportOutputPath = resolveOutputPath(opts.exportOutput, taskId, fmt);
+			}
+
 			const res = await sendRequest({ action: 'task.start', params });
 			if (opts.json) {
 				console.log(JSON.stringify(res, null, 2));
@@ -721,6 +771,9 @@ task
 				const speed = params.speed ? ' (加速)' : '';
 				const browser = !params.cloud && params.visual ? ' (独立浏览器)' : '';
 				console.log(`已通知客户端启动${mode}${speed}${browser}: ${taskId}`);
+				if (params.export) {
+					console.log(`采集完成后将自动导出 ${String(params.exportFormat).toUpperCase()} 到: ${params.exportOutputPath}`);
+				}
 			} else {
 				console.error('错误:', res.error);
 				process.exit(EXIT_OPERATION_FAILED);
@@ -1232,6 +1285,304 @@ Agent 使用最佳实践:
 					console.log(`使用 --fields ${suggestFields.join(',')} 查看特定字段`);
 				}
 				console.log('使用 --json 查看完整数据');
+			}
+		} catch (err: any) {
+			handleError(err);
+		}
+	});
+
+// task export
+task
+	.command('export <taskId>')
+	.description('导出任务采集数据到本地文件（xlsx/csv/json/html/xml）')
+	.option('--lot <lotId>', '指定批次 ID（省略则自动选最新批次）')
+	.option('--all', '导出全部历史数据（不按批次过滤）')
+	.option('--format <fmt>', '导出格式（xlsx/csv/json/html/xml，默认 xlsx）', 'xlsx')
+	.option('--output <path>', '输出目录或完整文件路径（默认 ~/Downloads/<任务名>.<格式>）')
+	.option('--list-lots', '列出可用批次，不执行导出')
+	.option('-y, --yes', '跳过交互式选择，使用默认值（最新批次 + xlsx）')
+	.option('--json', 'JSON 格式输出')
+	.addHelpText('after', `
+示例:
+
+  # 交互式选择批次和格式（TTY 环境）
+  $ octo task export abc123
+
+  # 跑完任务直接导出（无交互，最新批次 + xlsx → ~/Downloads）
+  $ octo task export abc123 --yes
+
+  # 指定格式
+  $ octo task export abc123 --format csv --yes
+
+  # 指定批次
+  $ octo task export abc123 --lot cld-001 --format json
+
+  # 导出全部历史数据
+  $ octo task export abc123 --all --format csv --yes
+
+  # 列出所有可用批次
+  $ octo task export abc123 --list-lots
+
+  # 列出批次（JSON，脚本用）
+  $ octo task export abc123 --list-lots --json
+
+  # 指定输出路径（目录）
+  $ octo task export abc123 --format csv --output ~/data --yes
+
+  # 指定输出路径（完整文件名）
+  $ octo task export abc123 --format json --output ~/data/result.json --yes
+
+  # 任务跑完后立刻导出的快捷链路
+  $ octo task stop abc123 && octo task export abc123 --format csv --yes
+
+参数说明:
+
+  --lot <lotId>     指定批次 ID；省略时进交互选择（TTY）或取最新批次（非 TTY/--yes）
+  --all             不按批次过滤，导出全部历史数据
+  --format <fmt>    导出格式：xlsx / csv / json / html / xml（默认 xlsx）
+  --output <path>   保存路径：目录（自动命名）或完整文件路径
+  --list-lots       仅列出批次，不导出
+  -y, --yes         跳过交互：lot=最新批次，format=xlsx，output=~/Downloads
+  --json            JSON 格式输出（导出结果或批次列表）
+
+交互式流程（无 --lot / --yes / 非 TTY 时）:
+
+  ? 选择采集批次
+    ❯ [云]  2026-04-23 13:45  1,234 条  (lot: cld-001)
+      [本地] 2026-04-23 12:30    567 条  (lot: lcl-002)
+      ...
+      全部历史数据（不按批次过滤）
+
+  ? 选择导出格式
+    ❯ Excel (.xlsx)
+      CSV (.csv)
+      JSON (.json)
+      HTML (.html)
+      XML (.xml)
+
+  ? 保存路径 (回车使用默认)
+  › ~/Downloads/央视新闻-2026-04-23.xlsx
+
+JSON 输出格式（--list-lots --json）:
+  [
+    { "lotId": "cld-001", "runOn": "cloud",  "time": "2026-04-23T13:45:00Z", "count": 1234, "status": "completed" },
+    { "lotId": "lcl-002", "runOn": "local",  "time": "2026-04-23T12:30:00Z", "count": 567,  "status": "completed" }
+  ]
+
+JSON 输出格式（导出完成 --json）:
+  {
+    "ok": true,
+    "taskId": "abc123",
+    "lotId": "cld-001",
+    "runOn": "cloud",
+    "format": "xlsx",
+    "outputPath": "/Users/xxx/Downloads/央视新闻-2026-04-23.xlsx",
+    "rowCount": 1234
+  }
+
+退出码:
+
+  0  导出成功
+  1  任务不存在、批次不存在、暂无数据或参数错误
+  2  客户端未启动`)
+	.action(async (taskId: string, opts: { lot?: string; all?: boolean; format?: string; output?: string; listLots?: boolean; yes?: boolean; json?: boolean }) => {
+		try {
+			const validFormats = ['xlsx', 'csv', 'json', 'html', 'xml'];
+			const format = (opts.format ?? 'xlsx').toLowerCase();
+			if (!validFormats.includes(format)) {
+				console.error(`错误: --format 只能是 ${validFormats.join(' / ')}`);
+				process.exit(EXIT_OPERATION_FAILED);
+			}
+
+			// --list-lots 模式：列出批次后退出
+			if (opts.listLots) {
+				const res = await sendRequest({ action: 'task.lots', params: { taskId } });
+				if (!res.ok) {
+					if (opts.json) {
+						console.log(JSON.stringify(res, null, 2));
+					} else {
+						console.error('错误:', res.error);
+					}
+					process.exit(EXIT_OPERATION_FAILED);
+				}
+
+				const lots: any[] = (res as any).lots ?? res.data?.lots ?? [];
+				if (opts.json) {
+					console.log(JSON.stringify(lots, null, 2));
+					return;
+				}
+
+				if (!lots.length) {
+					console.log('该任务暂无采集批次');
+					return;
+				}
+
+				console.log(`可用批次 (${lots.length}):\n`);
+				const cols = [
+					{ key: 'runOn', label: '来源', width: 8 },
+					{ key: 'time', label: '时间', width: 20 },
+					{ key: 'count', label: '数据量', width: 10 },
+					{ key: 'status', label: '状态', width: 8 },
+					{ key: 'lotId', label: '批次 ID', width: 36 },
+				];
+				console.log('  ' + cols.map((c) => padRight(c.label, c.width)).join(''));
+				for (const lot of lots) {
+					const runOnLabel = lot.runOn === 'cloud' ? '☁ 云' : '💻 本地';
+					console.log('  ' + [
+						padRight(runOnLabel, cols[0].width),
+						padRight(formatTime(lot.time), cols[1].width),
+						padRight(formatNumber(lot.count ?? 0), cols[2].width),
+						padRight(lot.status === 'completed' ? '已完成' : '采集中', cols[3].width),
+						padRight(lot.lotId ?? '-', cols[4].width),
+					].join(''));
+				}
+				return;
+			}
+
+			// 确定是否进入交互模式
+			const hasExplicitLot = !!opts.lot;
+			const shouldSkipInteractive =
+				hasExplicitLot ||
+				opts.all ||
+				opts.yes ||
+				!process.stdin.isTTY ||
+				process.env.OCTO_NO_INTERACTIVE === '1';
+
+			let lotId: string | undefined = opts.lot;
+			let selectedFormat = format;
+			let outputPath = opts.output;
+
+			if (!shouldSkipInteractive) {
+				// 交互模式：先获取批次列表
+				const lotsRes = await sendRequest({ action: 'task.lots', params: { taskId } });
+				if (!lotsRes.ok) {
+					console.error('错误:', lotsRes.error);
+					process.exit(EXIT_OPERATION_FAILED);
+				}
+
+				const lots: any[] = (lotsRes as any).lots ?? lotsRes.data?.lots ?? [];
+
+				// 批次选择
+				const lotChoices = lots.map((lot) => {
+					const runOnLabel = lot.runOn === 'cloud' ? '[云] ' : '[本地]';
+					const timeLabel = formatTime(lot.time);
+					const title = `${runOnLabel} ${timeLabel}  ${formatNumber(lot.count ?? 0)} 条  (lot: ${lot.lotId})`;
+					return { title, value: lot.lotId };
+				});
+				lotChoices.push({ title: '── 全部历史数据（不按批次过滤）', value: '__all__' });
+
+				const lotResponse = await prompts({
+					type: 'select',
+					name: 'lotId',
+					message: '选择采集批次',
+					choices: lotChoices,
+					initial: 0
+				}, {
+					onCancel: () => { console.log('已取消'); process.exit(1); }
+				});
+				if (!lotResponse.lotId) { console.log('已取消'); process.exit(1); }
+
+				if (lotResponse.lotId === '__all__') {
+					lotId = undefined;
+					// 全部历史模式，跳过 lotId
+				} else {
+					lotId = lotResponse.lotId;
+				}
+
+				// 格式选择
+				const formatResponse = await prompts({
+					type: 'select',
+					name: 'format',
+					message: '选择导出格式',
+					choices: [
+						{ title: 'Excel (.xlsx)', value: 'xlsx' },
+						{ title: 'CSV (.csv)', value: 'csv' },
+						{ title: 'JSON (.json)', value: 'json' },
+						{ title: 'HTML (.html)', value: 'html' },
+						{ title: 'XML (.xml)', value: 'xml' },
+					],
+					initial: 0
+				}, {
+					onCancel: () => { console.log('已取消'); process.exit(1); }
+				});
+				if (!formatResponse.format) { console.log('已取消'); process.exit(1); }
+				selectedFormat = formatResponse.format;
+
+				// 路径确认
+				const defaultPath = `~/Downloads/${taskId}-${new Date().toISOString().slice(0, 10)}.${selectedFormat}`;
+				const pathResponse = await prompts({
+					type: 'text',
+					name: 'outputPath',
+					message: '保存路径 (回车使用默认)',
+					initial: defaultPath
+				}, {
+					onCancel: () => { console.log('已取消'); process.exit(1); }
+				});
+				outputPath = pathResponse.outputPath || defaultPath;
+			}
+
+			// 解析输出路径
+			const resolvedOutput = resolveOutputPath(outputPath, taskId, selectedFormat);
+
+			// 文件已存在时的覆盖确认
+			const fs = require('fs');
+			if (fs.existsSync(resolvedOutput) && !opts.yes) {
+				if (process.stdin.isTTY) {
+					const confirmRes = await prompts({
+						type: 'confirm',
+						name: 'overwrite',
+						message: `文件已存在: ${resolvedOutput}，是否覆盖？`,
+						initial: false
+					}, {
+						onCancel: () => { console.log('已取消'); process.exit(1); }
+					});
+					if (!confirmRes.overwrite) {
+						console.log('已取消');
+						process.exit(0);
+					}
+				}
+			}
+
+			// 发送导出请求
+			const exportParams: Record<string, any> = {
+				taskId,
+				format: selectedFormat,
+				outputPath: resolvedOutput
+			};
+			if (lotId) exportParams.lotId = lotId;
+			if (opts.all || (!lotId && !opts.lot)) exportParams.all = !!(opts.all || (!lotId && !opts.lot && !shouldSkipInteractive));
+
+			if (!opts.json) {
+				process.stdout.write('正在导出...');
+			}
+
+			const res = await sendRequest({ action: 'task.export', params: exportParams });
+
+			if (!opts.json) {
+				process.stdout.write('\r');
+			}
+
+			if (!res.ok) {
+				if (opts.json) {
+					console.log(JSON.stringify(res, null, 2));
+				} else {
+					console.error(`错误: ${res.error}`);
+				}
+				process.exit(EXIT_OPERATION_FAILED);
+			}
+
+			const result = res.data ?? res;
+			if (opts.json) {
+				console.log(JSON.stringify({
+					ok: true,
+					taskId,
+					lotId: result.lotId ?? lotId,
+					format: selectedFormat,
+					outputPath: result.outputPath ?? resolvedOutput,
+					rowCount: result.rowCount ?? 0
+				}, null, 2));
+			} else {
+				console.log(`✓ 已导出 ${formatNumber(result.rowCount ?? 0)} 条数据到: ${result.outputPath ?? resolvedOutput}`);
 			}
 		} catch (err: any) {
 			handleError(err);
