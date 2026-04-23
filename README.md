@@ -195,6 +195,165 @@ $ octo task ls -q | xargs -I{} octo task stop {}
 
 ---
 
+### `octo task data <taskId>` - 查看任务采集结果
+
+查看任务采集的数据，支持按来源（云/本地）和范围（本次/全部历史）查询。
+
+**选项**:
+- `--run-on <source>` — 数据来源：`local` / `cloud` / `all`，默认 `local`
+- `--all` — 查询全部历史数据（默认只显示本次采集数据）
+- `--limit <n>` — 返回数据条数，默认 `20`，最大 `1000`
+- `--offset <n>` — 跳过前 `N` 条数据，默认 `0`
+- `--fields <list>` — 只返回指定字段，多个字段用逗号分隔
+- `--stats` — 只显示统计信息
+- `--schema` — 显示字段定义
+- `--json` — JSON 格式输出（Agent/脚本友好）
+- `--no-header` — 表格模式不显示表头
+
+**示例**:
+
+```bash
+# 查看本次采集数据（默认，与 GUI 一致）
+$ octo task data abc123
+任务数据:
+
+  任务 ID: abc123
+  数据来源: local
+  返回条数: 20
+  总数: 1,280
+  字段列表: 标题、链接、发布时间
+
+  标题                          链接                          发布时间
+  示例标题 1                    https://example.com/1         2026-04-23
+  示例标题 2                    https://example.com/2         2026-04-23
+
+# 查看全部历史数据
+$ octo task data abc123 --all
+
+# 查看云采集结果
+$ octo task data abc123 --run-on cloud
+
+# 同时查询本地和云端数据
+$ octo task data abc123 --run-on all
+
+# 只看前 50 条，并跳过前 100 条
+$ octo task data abc123 --limit 50 --offset 100
+
+# 只返回指定字段
+$ octo task data abc123 --fields 标题,链接,发布时间
+
+# 查看统计信息
+$ octo task data abc123 --stats
+
+# 查看字段定义
+$ octo task data abc123 --schema
+
+# JSON 格式输出（Agent 友好）
+$ octo task data abc123 --json
+{
+  "taskId": "abc123",
+  "runOn": "local",
+  "limit": 20,
+  "offset": 0,
+  "total": 1280,
+  "fields": ["标题", "链接", "发布时间"],
+  "items": [
+    {
+      "标题": "示例标题",
+      "链接": "https://example.com",
+      "发布时间": "2026-04-23"
+    }
+  ]
+}
+```
+
+#### 数据范围说明
+
+- **默认行为**：只显示本次采集数据（与 GUI 显示一致）
+  - 本地采集：最近一次启动后采集的数据
+  - 云采集：最近一次批次的数据
+- **`--all` 模式**：显示全部历史数据
+  - 包括所有历史采集记录
+
+**云/本地数据查询**:
+- 默认查询本地数据；如需云采集结果，请显式传入 `--run-on cloud`
+- `--run-on all` 会同时拉取本地和云端数据，适合排查两端结果差异
+- `--run-on all --all` 可同时查看本地和云端的全部历史数据
+- 数据查询不会修改任务状态，也不会影响采集进度
+
+#### Agent 使用最佳实践
+
+典型工作流（控制上下文，避免爆 token）：
+
+1. **先查统计信息**（轻量，不爆上下文）
+   ```bash
+   octo task data <taskId> --json --stats
+   ```
+   返回: `{ total, fields, fieldStats }`
+
+2. **查看字段定义**（了解数据结构）
+   ```bash
+   octo task data <taskId> --json --schema
+   ```
+   返回: `{ schema: [{ name, type, example }] }`
+
+3. **采样分析**（限制 10-20 条）
+   ```bash
+   octo task data <taskId> --json --limit 10
+   ```
+   返回: `{ items: [...] }`
+
+4. **按需过滤字段**（减少输出）
+   ```bash
+   octo task data <taskId> --json --fields 标题,链接,时间 --limit 20
+   ```
+   返回: 只包含指定字段的数据
+
+5. **分页查询**（大数据集）
+   ```bash
+   octo task data <taskId> --json --limit 100 --offset 0
+   octo task data <taskId> --json --limit 100 --offset 100
+   ```
+
+#### JSON 输出字段稳定性保证
+
+- `taskId`, `runOn`, `total`, `fields`, `items` 字段名不变
+- 退出码稳定：`0`=成功, `1`=失败, `2`=连接失败
+- 未知字段会报错（不会静默忽略）
+
+#### 数据范围注意事项
+
+- 默认只返回“本次采集”数据（与 GUI 一致）
+- 如需分析全部历史数据，显式传入 `--all`
+- 云采集和本地采集数据完全隔离，通过 `--run-on` 区分
+
+**JSON 输出格式说明**:
+- 默认 JSON 模式返回完整结构化结果，包含 `taskId`、`runOn`、分页信息、字段列表和数据项
+- `--stats --json` 时会额外返回 `stats`，其中 `fieldStats[].nonEmptyRate` 可能是 `0-1` 或百分比值，消费端应兼容两种形式
+- `--schema --json` 时会额外返回 `schema`，用于描述字段名、字段类型和示例值
+- `items` 为动态字段对象数组，字段名由任务实际采集列决定
+
+**所有 flags 详细说明**:
+
+| Flag | 说明 | 默认值 |
+|------|------|--------|
+| `--run-on <source>` | 指定查询来源。`local` 查询本地采集结果，`cloud` 查询云采集结果，`all` 同时查询两端 | `local` |
+| `--all` | 查询全部历史数据（默认只显示本次采集数据） | `false` |
+| `--limit <n>` | 限制返回条数，适合分页和批处理。允许范围 `0-1000` | `20` |
+| `--offset <n>` | 跳过前 `N` 条数据，常与 `--limit` 组合使用 | `0` |
+| `--fields <list>` | 只返回指定字段。多个字段使用英文逗号分隔，例如 `标题,链接,发布时间` | - |
+| `--stats` | 只输出统计信息，包括总数、字段列表和各字段非空率 | `false` |
+| `--schema` | 只输出字段定义，包括字段名、类型和示例值 | `false` |
+| `--json` | 输出结构化 JSON，适合 Agent、脚本、`jq` 和 API 桥接场景 | `false` |
+| `--no-header` | 表格模式下隐藏表头，便于简化终端输出或配合其他工具处理 | `false` |
+
+**退出码**:
+- `0` — 查询成功
+- `1` — 参数错误或查询失败
+- `2` — 客户端未启动
+
+---
+
 ### `octo task start <taskId>`
 
 启动采集任务（支持交互式选择或命令行参数）。
@@ -441,6 +600,15 @@ octo task list --json | jq '.[] | select(.mode == "cloud")'
 
 # 格式化输出任务名称和采集量
 octo task list --json | jq -r '.[] | "\(.taskName): \(.total) 条"'
+
+# 分页读取任务数据
+octo task data abc123 --limit 100 --offset 200 --json | jq '.items'
+
+# 查看云/本地数据条数差异
+octo task data abc123 --run-on all --stats --json | jq '.stats'
+
+# 只提取指定字段
+octo task data abc123 --fields 标题,链接 --json | jq '.items[]'
 ```
 
 ### CI/CD 集成示例
@@ -563,6 +731,62 @@ CLI 的 `--json` 输出格式保证向后兼容：
 - 新增字段：可能添加新字段，旧代码可忽略
 - 字段重命名：会保留旧字段别名
 - 字段删除：会提前在 changelog 中标记为 deprecated
+
+### `task.data` 输出 Schema
+
+`octo task data <taskId> --json` 的典型输出结构如下：
+
+```json
+{
+  "taskId": "abc123",
+  "runOn": "local",
+  "limit": 20,
+  "offset": 0,
+  "total": 1280,
+  "fields": ["标题", "链接", "发布时间"],
+  "items": [
+    {
+      "标题": "示例标题",
+      "链接": "https://example.com",
+      "发布时间": "2026-04-23"
+    }
+  ],
+  "stats": {
+    "total": 1280,
+    "fieldStats": [
+      {
+        "name": "标题",
+        "nonEmptyRate": 1
+      }
+    ]
+  },
+  "schema": [
+    {
+      "name": "标题",
+      "type": "string",
+      "example": "示例标题"
+    }
+  ]
+}
+```
+
+**字段说明**:
+- `taskId`: 任务 ID
+- `runOn`: 查询来源，`local` / `cloud` / `all`
+- `limit`: 本次返回的分页大小
+- `offset`: 本次查询的偏移量
+- `total`: 当前来源下的数据总条数
+- `fields`: 字段名列表
+- `items`: 数据项数组；每项为动态对象，键名由任务字段决定
+- `stats`: 统计信息；仅在请求统计信息或服务端返回时出现
+- `stats.total`: 统计口径下的总条数
+- `stats.fieldStats`: 字段统计数组
+- `stats.fieldStats[].name`: 字段名
+- `stats.fieldStats[].nonEmptyRate`: 非空率，可能为 `0-1` 小数或百分比数值
+- `schema`: 字段定义数组；仅在请求字段定义或服务端返回时出现
+- `schema[].name`: 字段名
+- `schema[].type`: 字段类型
+- `schema[].example`: 示例值
 
 ---
 

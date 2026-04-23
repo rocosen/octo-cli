@@ -53,7 +53,8 @@ function formatBrowser(browser: string): string {
 function formatRunOn(runOn: string): string {
 	switch (runOn) {
 		case 'cloud': return '云采集';
-		case 'local': return '本地';
+		case 'local': return '本地采集';
+		case 'all': return '本地+云采集';
 		default: return runOn;
 	}
 }
@@ -73,6 +74,85 @@ function formatNumber(n: number): string {
 	return n.toLocaleString('en-US');
 }
 
+function getDisplayWidth(str: string): number {
+	let width = 0;
+	for (const ch of str) {
+		width += ch.charCodeAt(0) > 0x7f ? 2 : 1;
+	}
+	return width;
+}
+
+const FIELD_PRIORITY = [
+	'title', 'url', 'name', 'id',
+	'time', 'date', 'publishTime', '发布时间',
+	'price', 'amount', '价格',
+	'status', 'state', '状态',
+	'content', 'description', '内容', '简介'
+];
+
+const MIN_TABLE_COLUMN_WIDTH = 15;
+const MAX_TABLE_COLUMN_WIDTH = 30;
+const MAX_TABLE_COLUMNS = 6;
+
+function getFieldPriorityIndex(field: string): number {
+	const normalized = field.toLowerCase();
+	return FIELD_PRIORITY.findIndex((keyword) => normalized.includes(keyword.toLowerCase()));
+}
+
+function selectDisplayFields(allFields: string[], maxCols: number = 5, preserveOrder = false): string[] {
+	if (preserveOrder) return allFields.slice(0, maxCols);
+
+	const prioritized = allFields
+		.map((field, index) => ({ field, index, priorityIndex: getFieldPriorityIndex(field) }))
+		.sort((a, b) => {
+			const aPriority = a.priorityIndex === -1 ? Number.MAX_SAFE_INTEGER : a.priorityIndex;
+			const bPriority = b.priorityIndex === -1 ? Number.MAX_SAFE_INTEGER : b.priorityIndex;
+			return aPriority - bPriority || a.index - b.index;
+		});
+
+	return prioritized.slice(0, maxCols).map((item) => item.field);
+}
+
+function getMaxColumns(terminalWidth: number, fieldCount: number): number {
+	const maxColsByWidth = Math.max(1, Math.floor(terminalWidth / MIN_TABLE_COLUMN_WIDTH) - 1);
+	return Math.max(1, Math.min(maxColsByWidth, fieldCount, MAX_TABLE_COLUMNS));
+}
+
+function getMaxColumnWidth(terminalWidth: number, columnCount: number): number {
+	const availableWidth = Math.max(terminalWidth - 4, MIN_TABLE_COLUMN_WIDTH);
+	return Math.max(
+		MIN_TABLE_COLUMN_WIDTH,
+		Math.min(MAX_TABLE_COLUMN_WIDTH, Math.floor(availableWidth / Math.max(1, columnCount)) - 1)
+	);
+}
+
+function stringifyFieldValue(value: any): string {
+	if (value === null || value === undefined) return '-';
+	if (typeof value === 'string') return value;
+	try {
+		const json = JSON.stringify(value);
+		if (json !== undefined) return json;
+	} catch {
+		// Fallback to String(value) for values that JSON.stringify cannot serialize.
+	}
+	return String(value);
+}
+
+function formatFieldValue(value: any, maxWidth: number): string {
+	const text = stringifyFieldValue(value);
+	if (getDisplayWidth(text) <= maxWidth) return text;
+
+	let width = 0;
+	let out = '';
+	for (const ch of text) {
+		const chWidth = ch.charCodeAt(0) > 0x7f ? 2 : 1;
+		if (width + chWidth > Math.max(0, maxWidth - 3)) break;
+		out += ch;
+		width += chWidth;
+	}
+	return out + '...';
+}
+
 function handleError(err: any): never {
 	const code = err instanceof CliError ? err.code : EXIT_OPERATION_FAILED;
 	console.error(err.message);
@@ -88,6 +168,7 @@ const rootHelpText = `
   octo task stop <taskId>                      停止任务
   octo task pause <taskId>                     暂停任务
   octo task resume <taskId>                    恢复任务
+  octo task data <taskId>                      查看任务采集结果数据
 
 批量操作示例:
   # 停止所有运行中的任务
@@ -140,6 +221,7 @@ const taskHelpText = `
   octo task stop <taskId>                     停止指定任务
   octo task pause <taskId>                    暂停指定任务
   octo task resume <taskId>                   恢复已暂停的任务
+  octo task data <taskId>                     查看任务采集结果数据
 
 批量操作示例:
   # 查询所有运行中任务的 ID
@@ -768,5 +850,392 @@ task
   1  任务未找到、未暂停或操作失败
   2  客户端未启动`)
 	.action(taskAction('resume', (id) => `任务 ${id} 已恢复`));
+
+task
+	.command('data <taskId>')
+	.description('查看任务采集结果数据')
+	.option('--run-on <source>', '数据来源（local/cloud/all，默认 local）', 'local')
+	.option('--all', '查询全部历史数据（默认只显示本次采集数据）')
+	.option('--limit <n>', '返回数据条数（默认 20，最大 1000）', '20')
+	.option('--offset <n>', '跳过前 N 条数据（默认 0）', '0')
+	.option('--fields <list>', '只返回指定字段（逗号分隔）')
+	.option('--stats', '只显示统计信息')
+	.option('--schema', '显示字段定义')
+	.option('--json', 'JSON 格式输出')
+	.option('--no-header', '表格不显示表头')
+	.addHelpText('after', `
+示例:
+
+  # 查看本次采集数据（默认，与 GUI 显示数量一致）
+  $ octo task data abc123
+
+  # 查看全部历史数据
+  $ octo task data abc123 --all
+
+  # 云采集的本次数据
+  $ octo task data abc123 --run-on cloud
+
+  # 云采集的全部历史数据
+  $ octo task data abc123 --run-on cloud --all
+
+  # 同时查询本地和云端的本次数据
+  $ octo task data abc123 --run-on all
+
+  # 同时查询本地和云端的全部历史数据
+  $ octo task data abc123 --run-on all --all
+
+  # 只看前 50 条，并跳过前 100 条
+  $ octo task data abc123 --limit 50 --offset 100
+
+  # 只返回指定字段
+  $ octo task data abc123 --fields 标题,链接,发布时间
+
+  # 查看统计信息
+  $ octo task data abc123 --stats
+
+  # 查看字段定义
+  $ octo task data abc123 --schema
+
+  # JSON 格式输出（Agent 友好）
+  $ octo task data abc123 --json
+
+  # Agent / 脚本使用：获取结构化结果
+  $ octo task data abc123 --run-on all --limit 100 --json
+
+  # Agent / 脚本使用：只看统计信息
+  $ octo task data abc123 --stats --json
+
+数据来源与查询范围:
+
+  - 默认只显示本次采集数据，与 GUI 一致
+  - 传入 --all 后，返回当前数据来源下的全部历史数据
+  - --run-on all 表示同时查询本地和云端两个数据来源
+  - --all 表示扩大到历史范围；它和 --run-on all 不是同一个含义
+
+参数说明:
+
+  --run-on <source>   数据来源：local / cloud / all，默认 local
+  --all               查询全部历史数据（默认只显示本次采集数据）
+  --limit <n>         返回数据条数，默认 20，最大 1000
+  --offset <n>        跳过前 N 条数据，默认 0
+  --fields <list>     只返回指定字段，多个字段用逗号分隔
+  --stats             只显示统计信息
+  --schema            显示字段定义
+  --json              JSON 格式输出
+  --no-header         表格模式不显示表头
+
+输出格式:
+
+  1. 表格模式
+     - 显示任务信息
+     - 显示字段列表
+     - 显示数据表格
+     - 根据终端宽度自动显示 1-6 列
+     - 优先显示标题、时间、链接、状态等重要字段
+     - 使用 --fields 指定想看的字段，使用 --json 查看完整数据
+
+  2. stats 模式
+     - 总数据条数
+     - 字段列表
+     - 各字段非空率
+
+  3. schema 模式
+     - 字段名
+     - 字段类型
+     - 示例值
+
+  4. JSON 模式
+     返回完整结构化数据，典型结构如下：
+     {
+       "taskId": "abc123",
+       "runOn": "local",
+       "limit": 20,
+       "offset": 0,
+       "total": 1280,
+       "fields": ["标题", "链接", "发布时间"],
+       "items": [
+         {
+           "标题": "示例标题",
+           "链接": "https://example.com",
+           "发布时间": "2026-04-23"
+         }
+       ],
+       "stats": {
+         "total": 1280,
+         "fieldStats": [
+           {
+             "name": "标题",
+             "nonEmptyRate": 1
+           }
+         ]
+       },
+       "schema": [
+         {
+           "name": "标题",
+           "type": "string",
+           "example": "示例标题"
+         }
+       ]
+     }
+
+Agent 使用最佳实践:
+
+  典型工作流（控制上下文，避免爆 token）：
+
+  1. 先查统计信息（轻量，不爆上下文）
+     $ octo task data <taskId> --json --stats
+     返回: { total, fields, fieldStats }
+
+  2. 查看字段定义（了解数据结构）
+     $ octo task data <taskId> --json --schema
+     返回: { schema: [{ name, type, example }] }
+
+  3. 采样分析（限制 10-20 条）
+     $ octo task data <taskId> --json --limit 10
+     返回: { items: [...] }
+
+  4. 按需过滤字段（减少输出）
+     $ octo task data <taskId> --json --fields 标题,链接,时间 --limit 20
+     返回: 只包含指定字段的数据
+
+  5. 分页查询（大数据集）
+     $ octo task data <taskId> --json --limit 100 --offset 0
+     $ octo task data <taskId> --json --limit 100 --offset 100
+
+  JSON 输出字段稳定性保证：
+  - taskId, runOn, total, fields, items 字段名不变
+  - 退出码稳定：0=成功, 1=失败, 2=连接失败
+  - 未知字段会报错（不会静默忽略）
+
+  数据范围注意事项：
+  - 默认只返回"本次采集"数据（与 GUI 一致）
+  - 如需分析全部历史数据，显式传入 --all
+  - 云采集和本地采集数据完全隔离，通过 --run-on 区分
+
+注意事项:
+
+  - 默认查询本地的本次采集数据；这与 GUI 中显示的数量一致
+  - 如需云采集结果，请显式传入 --run-on cloud
+  - 如需全部历史数据，请显式传入 --all
+  - --run-on all 适合排查本地/云端结果差异，--run-on all --all 则会查询两端全部历史数据
+  - --fields 只影响返回字段，不会修改任务本身的数据结构
+  - 表格模式会根据终端宽度自动选择显示列数，并优先展示重要字段
+  - 如需固定查看某些字段，请使用 --fields
+  - 超长字段会被截断显示，如需完整内容请使用 --json
+  - 统计信息中的非空率范围为 0-100%
+
+退出码:
+
+  0  查询成功
+  1  参数错误或查询失败
+  2  客户端未启动`)
+	.action(async (taskId: string, opts: { runOn?: string; all?: boolean; limit?: string; offset?: string; fields?: string; stats?: boolean; schema?: boolean; json?: boolean; header?: boolean }) => {
+		try {
+			const runOn = opts.runOn ?? 'local';
+			if (!['local', 'cloud', 'all'].includes(runOn)) {
+				console.error('错误: --run-on 只能是 local、cloud 或 all');
+				process.exit(EXIT_OPERATION_FAILED);
+			}
+
+			const limit = Number.parseInt(opts.limit ?? '20', 10);
+			if (!Number.isInteger(limit) || limit < 0 || limit > 1000) {
+				console.error('错误: --limit 必须是 0 到 1000 之间的整数');
+				process.exit(EXIT_OPERATION_FAILED);
+			}
+
+			const offset = Number.parseInt(opts.offset ?? '0', 10);
+			if (!Number.isInteger(offset) || offset < 0) {
+				console.error('错误: --offset 必须是大于等于 0 的整数');
+				process.exit(EXIT_OPERATION_FAILED);
+			}
+
+			const fields = opts.fields
+				? opts.fields.split(',').map(v => v.trim()).filter(Boolean)
+				: undefined;
+
+			const params: Record<string, any> = {
+				taskId,
+				runOn,
+				limit,
+				offset,
+			};
+			if (opts.all) params.all = true;
+			if (fields?.length) params.fields = fields;
+			if (opts.stats) params.stats = true;
+			if (opts.schema) params.schema = true;
+
+			const res = await sendRequest({ action: 'task.data', params });
+			if (!res.ok) {
+				if (opts.json) {
+					console.log(JSON.stringify(res, null, 2));
+				} else {
+					console.error('错误:', res.error);
+				}
+				process.exit(EXIT_OPERATION_FAILED);
+			}
+
+			const data = res.data ?? {};
+			if (opts.json) {
+				console.log(JSON.stringify(data, null, 2));
+				return;
+			}
+
+			const items: any[] = Array.isArray(data.items)
+				? data.items
+				: Array.isArray(data.list)
+					? data.list
+					: Array.isArray(data.rows)
+						? data.rows
+						: Array.isArray(data.data)
+							? data.data
+							: [];
+
+			const fieldNames: string[] = Array.isArray(data.fields)
+				? data.fields
+				: Array.isArray(data.fieldNames)
+					? data.fieldNames
+					: Array.isArray(data.columns)
+						? data.columns.map((c: any) => typeof c === 'string' ? c : (c?.name ?? c?.field ?? ''))
+						: (items[0] && typeof items[0] === 'object' ? Object.keys(items[0]) : []);
+
+			const total = typeof data.total === 'number'
+				? data.total
+				: typeof data.count === 'number'
+					? data.count
+					: items.length;
+			const taskName = [
+				data.taskName,
+				data.name,
+				data.task?.taskName,
+				data.task?.name,
+			].find((value) => typeof value === 'string' && value.trim()) ?? '-';
+			const dataScopeLabel = opts.all ? '全部历史数据' : '本次数据';
+
+			const normalizedSchema: Array<{ name: string; type: string; example: any }> = Array.isArray(data.schema)
+				? data.schema.map((item: any) => ({
+					name: item?.name ?? item?.field ?? '-',
+					type: item?.type ?? item?.valueType ?? '-',
+					example: item?.example ?? item?.sample ?? item?.sampleValue ?? '-'
+				}))
+				: fieldNames.map((name) => {
+					const sample = items.find((row) => row && row[name] !== undefined && row[name] !== null)?.[name];
+					return {
+						name,
+						type: sample === undefined || sample === null ? '-' : Array.isArray(sample) ? 'array' : typeof sample,
+						example: sample ?? '-'
+					};
+				});
+
+			const fieldStatsMap = new Map<string, any>();
+			if (Array.isArray(data.stats?.fieldStats)) {
+				for (const stat of data.stats.fieldStats) {
+					const key = stat?.name ?? stat?.field;
+					if (key) fieldStatsMap.set(key, stat);
+				}
+			}
+
+			const computedStats = fieldNames.map((name) => {
+				const existing = fieldStatsMap.get(name);
+				if (existing) {
+					const rate = existing.nonEmptyRate ?? existing.fillRate ?? existing.rate ?? 0;
+					return {
+						name,
+						nonEmptyRate: typeof rate === 'number' && rate <= 1 ? rate * 100 : Number(rate) || 0
+					};
+				}
+				const nonEmpty = items.filter((row) => {
+					const value = row?.[name];
+					return value !== undefined && value !== null && value !== '';
+				}).length;
+				const rate = items.length ? (nonEmpty / items.length) * 100 : 0;
+				return { name, nonEmptyRate: rate };
+			});
+
+			if (opts.stats) {
+				console.log('统计信息:\n');
+				console.log(`  任务 ID: ${taskId}`);
+				console.log(`  数据来源: ${formatRunOn(runOn)}`);
+				console.log(`  总数: ${formatNumber(total)}`);
+				console.log(`  字段列表: ${fieldNames.length ? fieldNames.join('、') : '-'}`);
+				console.log('\n  非空率:');
+				for (const stat of computedStats) {
+					console.log(`  ${padRight(stat.name, 20)}${stat.nonEmptyRate.toFixed(1)}%`);
+				}
+				return;
+			}
+
+			if (opts.schema) {
+				const cols = [
+					{ key: 'name', label: '字段名', width: 20 },
+					{ key: 'type', label: '类型', width: 12 },
+					{ key: 'example', label: '示例值', width: 30 },
+				];
+
+				console.log('字段定义:\n');
+				console.log(`  任务 ID: ${taskId}`);
+				console.log(`  数据来源: ${formatRunOn(runOn)}`);
+				console.log(`  字段数: ${normalizedSchema.length}`);
+				console.log('');
+
+				if (opts.header !== false) {
+					console.log('  ' + cols.map((c) => padRight(c.label, c.width)).join(''));
+				}
+
+				for (const item of normalizedSchema) {
+					console.log('  ' + [
+						padRight(formatFieldValue(item.name, cols[0].width - 2), cols[0].width),
+						padRight(formatFieldValue(item.type, cols[1].width - 2), cols[1].width),
+						padRight(formatFieldValue(item.example, cols[2].width - 2), cols[2].width),
+					].join(''));
+				}
+				return;
+			}
+
+			console.log(`任务: ${taskName} (${taskId}) - ${formatRunOn(runOn)} - ${dataScopeLabel}\n`);
+			console.log(`  返回条数: ${items.length}`);
+			console.log(`  总数: ${formatNumber(total)}`);
+			console.log(`  字段列表: ${fieldNames.length ? fieldNames.join('、') : '-'}`);
+			console.log('');
+
+			if (!items.length) {
+				console.log('  暂无数据');
+				return;
+			}
+
+			const terminalWidth = process.stdout.columns || 120;
+			const maxCols = getMaxColumns(terminalWidth, fieldNames.length);
+			const displayFields = selectDisplayFields(fieldNames, maxCols, Boolean(fields?.length));
+			const maxColumnWidth = getMaxColumnWidth(terminalWidth, Math.max(1, displayFields.length));
+			const cols = displayFields.map((name) => {
+				let width = Math.min(maxColumnWidth, Math.max(MIN_TABLE_COLUMN_WIDTH, getDisplayWidth(name) + 2));
+				for (const row of items) {
+					const candidate = formatFieldValue(row?.[name], maxColumnWidth - 2);
+					width = Math.min(maxColumnWidth, Math.max(width, getDisplayWidth(candidate) + 2));
+				}
+				return { name, width };
+			});
+
+			if (opts.header !== false) {
+				console.log('  ' + cols.map((c) => padRight(formatFieldValue(c.name, c.width - 2), c.width)).join(''));
+			}
+
+			for (const row of items) {
+				console.log('  ' + cols.map((c) => padRight(formatFieldValue(row?.[c.name], c.width - 2), c.width)).join(''));
+			}
+
+			if (displayFields.length < fieldNames.length) {
+				const hiddenFields = fieldNames.filter((name) => !displayFields.includes(name));
+				const suggestFields = hiddenFields.slice(0, 3);
+				console.log('');
+				console.log(`提示: 已隐藏 ${hiddenFields.length} 个字段: ${hiddenFields.join('、')}`);
+				if (suggestFields.length) {
+					console.log(`使用 --fields ${suggestFields.join(',')} 查看特定字段`);
+				}
+				console.log('使用 --json 查看完整数据');
+			}
+		} catch (err: any) {
+			handleError(err);
+		}
+	});
 
 program.parse();

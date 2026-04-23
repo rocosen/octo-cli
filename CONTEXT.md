@@ -169,6 +169,7 @@ interface CliResponse {
 | `task.stop` | `{ taskId }` | taskController → fallback executeRunnerCommand | 无 |
 | `task.pause` | `{ taskId }` | taskController → fallback executeRunnerCommand | 无 |
 | `task.resume` | `{ taskId }` | taskController → fallback executeRunnerCommand | 无 |
+| `task.data` | `{ taskId, runOn?, all?, limit?, offset?, fields?, stats?, schema? }` | 查询任务采集数据 | `CliTaskDataResponse` |
 
 ### task.list 返回的 CliTaskInfo 结构
 
@@ -299,6 +300,146 @@ octo task stop <taskId>      # 停止任务（支持本地/云采集，新旧引
 octo task pause <taskId>     # 暂停任务（仅本地采集）
 octo task resume <taskId>    # 恢复任务（仅本地采集）
 ```
+
+### `octo task data <taskId>` (v0.5.0 新增)
+
+查询任务采集数据，支持本地/云/聚合三种视角，并提供字段过滤、统计和 schema 探测能力。
+
+```bash
+# 本次采集数据（默认）
+octo task data abc123
+
+# 全部历史数据
+octo task data abc123 --all
+
+# 云采集本次数据
+octo task data abc123 --run-on cloud
+
+# 云采集全部历史数据
+octo task data abc123 --run-on cloud --all
+
+# 本地 + 云端本次数据
+octo task data abc123 --run-on all
+
+# 本地 + 云端全部历史数据
+octo task data abc123 --run-on all --all
+
+# 仅查询本地采集数据
+octo task data <taskId> --run-on local
+
+# 仅返回指定字段
+octo task data <taskId> --fields title,price    # 仅返回指定字段
+octo task data <taskId> --stats                 # 返回字段非空率统计
+octo task data <taskId> --schema                # 返回字段 schema（field/type/example）
+octo task data <taskId> --limit 100 --offset 200
+```
+
+**参数约束**:
+- `runOn`: `local` / `cloud` / `all`，CLI 默认 `local`
+- `all`: 布尔值；默认 `false`，传入后查询全部历史数据
+- `limit`: 1 到 1000 之间的整数，默认 `20`
+- `offset`: 大于等于 `0` 的整数，默认 `0`
+- `fields`: 逗号分隔字段列表；若指定不存在字段，返回错误
+- `stats`: 返回字段统计信息，不返回数据行
+- `schema`: 返回字段 schema，不返回数据行
+
+**返回模式**:
+- 默认查询: `{ taskId, runOn, all, total, offset, limit, rows }`
+- `--stats`: `{ taskId, runOn, all, total, fieldCount, fields, rows: [] }`
+- `--schema`: `{ taskId, runOn, all, total, schema }`
+
+**说明**:
+- 查询前会先校验任务是否存在（通过 `window.__cliQuery.getTask()`）
+- 当 `runOn=all` 时，会合并本地和云端数据，并为每条记录补充 `_runOn: 'local' | 'cloud'`
+- 若任务不存在、查询服务未就绪、字段不存在或任务暂无数据，均返回错误
+
+## 任务数据查询（v0.5.0 新增）
+
+### 数据隔离说明（云/本地）
+
+任务采集数据分为两套独立存储：
+- **本地采集数据**：保存在客户端本地 SQLite 中，由 `TaskFileContronller(taskId)` 读取；默认按 `lotId` 过滤，返回结果经过 `common.fileToObject()` 和 `common.transformRealName()` 转换为结构化对象
+- **云采集数据**：默认通过 `taskDataService.getDataByLot(taskId, lotId, offset, limit)` 查询最近批次；传入 `--all` 后改为 `taskDataService.getDataByOffset(taskId, offset, limit)` 查询全部历史；返回 `files` 数组和 `total`
+
+两套数据的存储位置、生命周期和字段集合都可能不同，因此 `task.data` 默认按 `runOn` 显式区分查询来源。
+
+### 数据范围（默认 vs --all）
+
+**默认行为**（无 `--all`）：
+- 本地采集：按最近一次 `LotId` 过滤数据
+- 云采集：按最近一次 `lot` 查询数据
+- 对应 GUI 显示的"本次采集"数据量
+
+**--all 模式**：
+- 本地采集：查询全部 SQLite 历史数据
+- 云采集：查询全部云端历史数据
+
+### 实现细节（批次标识）
+
+- `CollectHistory.LotId` 用于标识本地采集批次；若缺失，则回退到 `TaskLotContronller(taskId).getTaskLots({ pageIndex: 1, pageSize: 1, order: 'beginTime-DESC' })` 返回的最新 `LotId`
+- `GetCloudLiveInfo().lot` 用于标识云采集批次；若缺失，则回退到 `GetCloudHistoryInfo()` 返回的最新 `lot`
+- 默认查询与 GUI 行为一致，都会以最近一次批次作为"本次采集"范围
+
+### 查询逻辑（local/cloud/all）
+
+**参数标准化** (`cli-server.ts normalizeTaskDataParams`):
+1. 校验 `taskId` 必填
+2. 标准化 `runOn`，仅允许 `local` / `cloud` / `all`
+3. 校验 `limit` 范围为 1 到 1000
+4. 校验 `offset >= 0`
+5. 将 `fields` 字符串拆分为字段数组
+6. 将 `all` / `stats` / `schema` 解析为布尔值
+
+**执行路径**:
+- `runOn=local`: 调用 `window.__cliQuery.getLocalData(taskId, offset, limit, all)`
+- `runOn=cloud`: 调用 `window.__cliQuery.getCloudData(taskId, offset, limit, all)`
+- `runOn=all`: 调用 `window.__cliQuery.getAllData(taskId, offset, limit, all)`
+
+**聚合逻辑** (`getAllData`):
+1. 分别查询本地和云端数据，但内部使用 `mergedLimit = offset + limit`
+2. 将本地记录补充 `_runOn: 'local'`
+3. 将云端记录补充 `_runOn: 'cloud'`
+4. 合并后统一 `slice(offset, offset + limit)`，并返回 `local.total + cloud.total`
+
+这样可以保证 `all` 视角下的分页结果来自合并后的统一视图，而不是分别分页后再拼接。
+
+### 字段过滤、统计、schema 功能
+
+**字段过滤**:
+- 先扫描当前查询结果的所有行，得到 `allFields`
+- 若传入 `fields`，会校验字段是否全部存在
+- 字段存在时，通过 `pickFields()` 只保留指定字段
+
+**统计模式** (`stats=true`):
+- 使用 `buildStats()` 计算每个字段的 `nonEmptyRate`
+- 非空定义：值不为 `undefined` / `null` / 空字符串
+- 返回 `{ fieldCount, fields: [{ field, nonEmptyRate }] }`
+
+**Schema 模式** (`schema=true`):
+- 优先使用查询结果自带的 `schema`
+- 若数据源未直接返回 schema，则用 `buildSchema()` 基于样本行推断
+- 推断结果包含:
+  - `field`: 字段名
+  - `type`: `string` / `number` / `boolean` / `object` / `array` / `null` / `unknown`
+  - `example`: 样本值
+
+### 限制（最大 1000 条）
+
+- `limit` 最大值为 `1000`，超出直接报错
+- `offset` 允许任意非负整数，但实际返回仍受 `limit` 限制
+- 当 `queryResult.total === 0` 或 `rows` 为空数组时，返回 `任务暂无数据`
+- 当前为只读查询接口，不支持导出、删除、修改数据
+
+### 实现文件清单
+
+**octopus 仓库**:
+- `src/main/cli-server.ts`
+  - 新增 `task.data` action 路由
+  - 新增 `normalizeTaskDataParams()`、`getAllFieldNames()`、`pickFields()`、`buildStats()`、`buildSchema()`、`handleTaskData()`
+  - 定义 `CliTaskDataFieldStat` / `CliTaskDataSchemaItem`
+- `src/renderer/pages/home/index.tsx`
+  - 在 `window.__cliQuery` 上新增 `getTask()`、`getLocalData()`、`getCloudData()`、`getAllData()`
+  - 复用 `TaskService.getTask()`、`taskDataService.getDataByLot()` / `taskDataService.getDataByOffset()`、`TaskFileContronller`
 
 ### 通用选项
 
@@ -544,6 +685,57 @@ OCTO_NO_INTERACTIVE=1 octo task start abc123 --cloud
 - 展开时机：在 cli-server.ts 聚合数据时展开，CLI 端直接渲染
 - 过滤策略：默认模式只保留有数据的记录（status=running/paused 或 total>0）
 
+## v0.5.0 更新内容（2026-04-23）
+
+### 新增功能
+
+1. **`task.data` 任务数据查询**
+   - 新增 `task.data` action，支持按任务 ID 查询采集数据
+   - 支持 `runOn=local/cloud/all` 三种查询视角
+   - 默认返回本次采集数据，支持 `--all` 查询全部历史数据
+   - 支持分页（`limit` / `offset`）
+
+2. **字段过滤**
+   - 支持通过 `fields` 指定返回字段子集
+   - 查询前校验字段是否存在，避免静默返回空列
+
+3. **统计与 schema 探测**
+   - `stats=true` 返回字段非空率统计
+   - `schema=true` 返回字段类型和样本值
+   - 便于脚本和 Agent 在读取大批量数据前先做字段探查
+
+4. **云/本地数据统一查询**
+   - 本地数据通过本地文件控制器读取
+   - 云数据通过任务数据服务读取
+   - `runOn=all` 时返回合并后的统一视图，并补充 `_runOn` 标记来源
+
+### 技术改动
+
+**octopus 仓库**:
+- `src/main/cli-server.ts`
+  - 新增 `task.data` 请求处理链路
+  - 增加参数标准化、字段过滤、统计和 schema 推断逻辑
+  - 支持 `all` 参数，将"本次采集"与"全部历史"查询范围分离
+  - 增加 `limit <= 1000` 和字段存在性校验
+- `src/renderer/pages/home/index.tsx`
+  - 扩展 `window.__cliQuery` 数据查询桥接
+  - 新增本地/云/聚合三种数据读取方法
+  - 默认按最新 `LotId` / `lot` 查询，与 GUI 的"本次采集"范围保持一致
+
+### 设计决策
+
+**为什么区分 local/cloud/all？**
+- 本地采集和云采集的数据来源不同，生命周期和字段集合也可能不同
+- 单独查询可避免混淆，聚合查询则方便做统一预览和脚本处理
+
+**为什么 `all` 需要先扩容再分页？**
+- 如果本地和云端各自先按 `limit` 分页，再合并，会导致聚合视图分页不稳定
+- 先读取 `offset + limit`，再合并切片，可以保证 `all` 视图的分页语义一致
+
+**为什么 `stats` 和 `schema` 不返回 `rows`？**
+- 两者的目标是“探查结构”而非“读取内容”
+- 返回空 `rows` 可减少输出体积，也更适合脚本消费
+
 ## 下一步
 
 ### v2 功能规划
@@ -551,7 +743,6 @@ OCTO_NO_INTERACTIVE=1 octo task start abc123 --cloud
 1. **task start 确认机制**: 考虑增加 `--wait` 标志，等待任务实际出现在 runnerMap/workflows 中后再返回
 2. **任务数据操作**:
    - `task export <taskId>` - 导出任务数据
-   - `task data <taskId>` - 查看任务数据预览
 3. **任务管理增强**:
    - `task create` - 创建新任务
    - `task delete <taskId>` - 删除任务
